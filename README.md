@@ -1,5 +1,7 @@
-# cloning
-Semi-Automatic Cloning Scripts
+# Network-based Cloning Scripts
+A pair of semi-automatic cloning scripts that allow you to clone drives over the network.
+
+Run the scripts from any Linux system or live CD and you can clone any filesystem.  These scripts work at the block-level, so all filesystems are supported.
 
 Requirements:  You must install pv and lz4.   
 On Debian/Ubuntu systems, you can do this by running:
