@@ -1,0 +1,177 @@
+#!/bin/bash
+IFS="
+"
+count=0
+bold=$(tput bold)
+normal=$(tput sgr0)
+compressed=1
+
+get_bootloader_bytes () {
+	SECTORSIZE=`fdisk -l /dev/$disk | grep "^Sector size" | cut -d'/' -f2 | cut -d' ' -f2`
+	START=""
+	for i in `fdisk -l /dev/$disk | grep "^\/dev\/" | sed -e 's/\/dev\/[a-z]*[0-9]*[ \*]*//' | cut -d' ' -f1`
+	do
+	        if [ "$START" == "" ] && [ ! "$i" == "" ]; then
+	                START=$i
+	        fi
+	        if [ ! "$i" == "" ] && [ ! "$START" == "" ]; then
+	                if [ $i -lt $START ]; then
+	                        START=$i
+	                fi
+	        fi
+	done
+	if [ $START -ge 0 ]; then
+	        BOOTLOADER_BYTES=$((START * SECTORSIZE))
+		BOOTLOADER_BYTES=$((BOOTLOADER_BYTES - 1))
+	else
+		BOOTLOADER_BYTES=512
+	fi
+}
+
+
+
+echo	"ID	Option Type"
+echo	"1	Disk"
+echo	"2	Partition"
+echo	"3	MBR"
+echo	"4	File"
+echo -n "Type the ID of the type of clone that you wish to perform [1]: "
+read option
+
+case $option in
+1)
+	type="disk"
+	;;
+2)
+	type="partition"
+	;;
+3)
+	type="MBR"
+	;;
+4)
+	type="file"
+	;;
+*)
+	type="disk"
+	;;
+esac
+
+echo ""
+echo "ID	$type"
+if [ "$type" == "partition" ]; then
+	for i in `lsblk -e 7 -e 11 -l | grep "part" | sed -e 's/^\([a-z0-9]*\) * [0-9]*:[0-9]* *[0-9] *\([0-9\.GMKT]*\) .*/\1 \2/' | sort`
+	do
+		count=$((count+1))
+		echo "$count	$i"
+		disks="$disks"$'\n'"$count $i"
+	done
+elif [ "$type" == "file" ]; then
+	echo -n "File name: "
+	read filename
+	if [ "$filename" == "" ] || [ ! -f "$filename" ]; then
+		echo "Exiting.  Invalid file name."
+		exit
+	fi
+else
+	for i in `lsblk -e 7 -e 11 -l | grep "disk" | sed -e 's/^\([a-z0-9]*\) * [0-9]*:[0-9]* *[0-9] *\([0-9\.GMKT]*\) .*/\1 \2/' | sort`
+	do
+		count=$((count+1))
+		echo "$count	$i"
+		disks="$disks"$'\n'"$count $i"
+	done
+fi
+if [ ! "$type" == "file" ]; then
+	echo ""
+	echo -n "Type the ID matching the $type that you wish to ${bold}copy${normal}: "
+	read disknum
+	disk=`echo "$disks" | grep "^$disknum " | cut -d' ' -f2`
+	if [ "$disk" == "" ]; then
+		echo "Sorry, but that is not a valid selection.  Exiting."
+		exit
+	fi
+fi
+
+
+echo "Ready to copy $type ${bold}$disk${normal}."
+if [ ! "$type" == "file" ]; then
+	umount /dev/${disk}* > /dev/null 2>&1
+	blockdev --setra 8192 /dev/${disk} > /dev/null 2>&1
+	OLDRA=`blockdev --getra /dev/${disk}`
+	OLDSWAP=`cat /proc/sys/vm/swappiness`
+	echo 0 > /proc/sys/vm/swappiness > /dev/null 2>&1
+fi
+
+IP=`ifconfig | grep "inet addr" | grep -v "addr: " | grep -v "127.0.0.1" | cut -d':' -f2 | cut -d' ' -f1 | grep "" -m1`
+
+echo "Waiting for handshake from target server."
+RESULT=`echo "ready" | nc -l -p 1234 -w30 -q1 -u`
+if [ "$RESULT" == "" ]; then
+        echo "Automatic discover timeout. Would you like to wait longer?"
+        echo -n "[${bold}y${normal}|n]: "
+        read WAITLONGER
+	if [ "$WAITLONGER" == "n" ] || [ "$WAITLONGER" == "N" ]; then
+	        echo "Please enter the IP manually, or ctl-c to exit."
+	        echo -n "Remote IP:PORT : "
+	        read RESULT
+	else
+		RESULT=`echo "ready" | nc -l -p 1234 -w60 -q1 -u`
+	fi
+	if [ "$RESULT" == "" ]; then
+		echo "Automatic discover timeout. Please enter the IP manually, or ctl-c and restart to resume auto detection."
+		echo -n "Remote IP:PORT : "
+		read RESULT
+	fi
+fi
+
+REMOTEIP=`echo $RESULT | cut -d':' -f1`
+RPORT=`echo $RESULT | cut -d':' -f2`
+if [ "$RPORT" == "" ] || [ "$RPORT" == "$REMOTEIP" ]; then
+	RPORT=1235
+fi
+
+if [ "$REMOTEIP" == "" ]; then
+	echo "No remote IP detected.  Aborting."
+	exit
+fi
+echo -n "Do you want to send this image to ${bold}$REMOTEIP:$RPORT${normal}? [y]: "
+read answer
+if [ ! "$answer" == "y" ] && [ ! "$answer" == "Y" ] && [ ! "$answer" == "yes" ] && [ ! "$answer" == "" ]; then
+	echo "Aborted"
+	exit
+fi
+
+if [ "$type" == "file" ]; then
+        source="$filename"
+	size=`du -s $filename | sed -e 's/^\([0-9]*\).*$/\1/'`
+	compressed=`echo $filename | sed -e 's/.*\.//' | grep lz4 | wc -l`
+else
+        source="/dev/$disk"
+	size=`lsblk -o size,name -b -l | sed -e 's/^ *//' | grep " $disk$" | cut -d' ' -f1`
+fi
+
+if [ "$size" == "" ]; then
+	size=1;
+fi
+
+CONFIRMED="0"
+while [ "$CONFIRMED" == "0" ];
+do
+	CONFIRMED=`echo "$size:$compressed" | nc -w1 $REMOTEIP $RPORT 2> /dev/null && echo 1 || sleep 1 && echo 0`
+done
+
+sleep 2
+
+if [ "$type" == "MBR" ]; then
+	get_bootloader_bytes
+	dd bs=1 count=$BOOTLOADER_BYTES if=$source | lz4 | nc $REMOTEIP $RPORT -w1
+elif [ "$type" == "file" ]; then
+	# Assume that files that are stored are already compressed with lz4
+	sudo pv -btearp -B 4194304 -N SOURCE < $source | nc $REMOTEIP $RPORT -w1
+else
+	sudo pv -btearp -B 4194304 -N SOURCE < $source | lz4 -3 | nc $REMOTEIP $RPORT -w1
+fi
+
+if [ ! "$type" == "file" ]; then
+	echo $OLDSWAP > /proc/sys/vm/swappiness
+	blockdev --setra $OLDRA /dev/${disk}
+fi
